@@ -1,0 +1,41 @@
+name: studio-opensearch
+on:
+  pull_request:
+    paths:
+      - exporter/opensearchexporter/**
+      - cmd/studio-otelcol/**
+      - .github/workflows/studio-opensearch.yml
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test-and-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+      - uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417 # v6
+        with:
+          go-version: 1.26.11
+          cache-dependency-path: exporter/opensearchexporter/go.sum
+      - name: Test OpenSearch exporter, including retries and Studio documents
+        working-directory: exporter/opensearchexporter
+        run: go test -race -timeout 5m ./...
+      - name: Generate the optional Studio distribution
+        run: |
+          mkdir -p dist
+          go run go.opentelemetry.io/collector/cmd/builder@v0.148.0 --config=cmd/studio-otelcol/builder-config.yaml --skip-compilation
+      - name: Build Linux binaries without publishing an image
+        working-directory: dist/studio-otelcol
+        run: |
+          mkdir -p ../../artifacts
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH=$arch go build -trimpath -o ../../artifacts/studio-otelcol_linux_$arch .
+          done
+          cd ../../artifacts
+          sha256sum studio-otelcol_linux_* > SHA256SUMS
+      - uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        with:
+          name: studio-opensearch-collector
+          path: artifacts/
+          retention-days: 14

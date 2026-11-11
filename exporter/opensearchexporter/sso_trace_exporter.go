@@ -30,9 +30,13 @@ type ssoTracesExporter struct {
 }
 
 func newSSOTracesExporter(cfg *Config, set exporter.Settings) *ssoTracesExporter {
-	model := &encodeModel{
+	var model mappingModel = &encodeModel{
 		dataset:   cfg.Dataset,
 		namespace: cfg.Namespace,
+	}
+
+	if cfg.Mode == MappingStudio.String() {
+		model = &studioMappingModel{}
 	}
 
 	return &ssoTracesExporter{
@@ -64,6 +68,7 @@ func (s *ssoTracesExporter) Start(ctx context.Context, host component.Host) erro
 
 func (s *ssoTracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces) error {
 	indexer := newTraceBulkIndexer(s.bulkAction, s.model)
+	indexer.logger = s.telemetry.Logger
 	startErr := indexer.start(s.client)
 	if startErr != nil {
 		return startErr
@@ -76,9 +81,13 @@ func (s *ssoTracesExporter) pushTraceData(ctx context.Context, td ptrace.Traces)
 }
 
 func newOpenSearchClient(endpoint string, httpClient *http.Client, logger *zap.Logger) (*opensearchapi.Client, error) {
+	transport := httpClient.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
+	}
 	return opensearchapi.NewClient(opensearchapi.Config{
 		Client: opensearch.Config{
-			Transport: httpClient.Transport,
+			Transport: bulkTransport{base: transport},
 
 			// configure connection setup
 			Addresses:    []string{endpoint},

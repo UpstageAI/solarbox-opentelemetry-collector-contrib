@@ -7,6 +7,7 @@ package opensearchexporter // import "github.com/open-telemetry/opentelemetry-co
 
 import (
 	"context"
+	"errors"
 
 	"go.opentelemetry.io/collector/component"
 	"go.opentelemetry.io/collector/config/confighttp"
@@ -46,6 +47,9 @@ func createTracesExporter(ctx context.Context,
 	cfg component.Config,
 ) (exporter.Traces, error) {
 	c := cfg.(*Config)
+	if c.Mode == MappingStudio.String() && c.TracesIndex == "" {
+		return nil, errors.New("studio traces require traces_index")
+	}
 	te := newSSOTracesExporter(c, set)
 
 	return exporterhelper.NewTraces(ctx, set, cfg,
@@ -62,6 +66,9 @@ func createLogsExporter(ctx context.Context,
 	cfg component.Config,
 ) (exporter.Logs, error) {
 	c := cfg.(*Config)
+	if c.Mode == MappingStudio.String() && c.LogsIndex == "" {
+		return nil, errors.New("studio logs require logs_index")
+	}
 	le := newLogExporter(c, set)
 
 	return exporterhelper.NewLogs(ctx, set, cfg,

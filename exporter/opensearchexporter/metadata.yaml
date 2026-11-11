@@ -14,5 +14,8 @@ status:
 tests:
   expect_consumer_error: true
   config:
+    # Lifecycle coverage has no OpenSearch server; retry behavior has dedicated tests.
+    retry_on_failure:
+      enabled: false
     http:
-      endpoint: https://opensearch.example.com:9200
+      endpoint: http://127.0.0.1:1

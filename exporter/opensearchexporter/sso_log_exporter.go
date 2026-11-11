@@ -29,11 +29,14 @@ type logExporter struct {
 
 func newLogExporter(cfg *Config, set exporter.Settings) *logExporter {
 	var model mappingModel
-	if cfg.Mode == MappingBodyMap.String() {
+	switch cfg.Mode {
+	case MappingStudio.String():
+		model = &studioMappingModel{}
+	case MappingBodyMap.String():
 		model = &bodyMapMappingModel{
 			bufferPool: pool.NewBufferPool(),
 		}
-	} else {
+	default:
 		model = &encodeModel{
 			dedup:             cfg.Dedup,
 			dedot:             cfg.Dedot,
@@ -73,6 +76,7 @@ func (l *logExporter) Start(ctx context.Context, host component.Host) error {
 
 func (l *logExporter) pushLogData(ctx context.Context, ld plog.Logs) error {
 	indexer := newLogBulkIndexer(l.bulkAction, l.model)
+	indexer.logger = l.telemetry.Logger
 	startErr := indexer.start(l.client)
 	if startErr != nil {
 		return startErr

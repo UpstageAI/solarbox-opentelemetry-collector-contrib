@@ -108,6 +108,7 @@ The OpenSearch exporter supports several document schemas and preprocessing beha
     - `ss4o`: Exports logs in the [Simple Schema for Observability](https://opensearch.org/docs/latest/observing-your-data/ss4o/) standard.
     - `ecs`: Maps fields defined in the OpenTelemetry Semantic Conventions to the [Elastic Common Schema](https://www.elastic.co/guide/en/ecs/current/index.html)
     - `flatten_attributes`: Uses the ECS mapping but flattens all resource and log attributes in the record to the top-level.
+    - `studio`: preserves the Studio OTLP document schema and stable document IDs. Requires `bulk_action: index`, explicit log/trace routing indices, and no index time suffix. See [the optional Studio distribution](../../cmd/studio-otelcol/README.md).
     - `bodymap`: uses the "body" of a log record as the exact content of the OpenSearch document, without any transformation. This mapping mode is intended for use cases where the client wishes to have complete control over the OpenSearch document structure.
   - `timestamp_field`: (optional) Field to store the timestamp in. If not set, uses the default `@timestamp`.
   - `unix_timestamp`: (optional) Whether to store the timestamp in epoch milliseconds.

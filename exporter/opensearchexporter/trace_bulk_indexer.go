@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"sync"
 	"time"
 
 	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
@@ -16,21 +17,26 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/ptrace"
+	"go.uber.org/zap"
 )
 
 type traceBulkIndexer struct {
 	bulkAction  string
 	model       mappingModel
+	logger      *zap.Logger
+	errsMu      sync.Mutex
 	errs        []error
 	bulkIndexer opensearchutil.BulkIndexer
 }
 
 func newTraceBulkIndexer(bulkAction string, model mappingModel) *traceBulkIndexer {
-	return &traceBulkIndexer{bulkAction: bulkAction, model: model, errs: nil, bulkIndexer: nil}
+	return &traceBulkIndexer{bulkAction: bulkAction, model: model, logger: zap.NewNop()}
 }
 
 func (tbi *traceBulkIndexer) joinedError() error {
-	return errors.Join(tbi.errs...)
+	tbi.errsMu.Lock()
+	defer tbi.errsMu.Unlock()
+	return joinTracesErrors(tbi.errs)
 }
 
 func (tbi *traceBulkIndexer) start(client *opensearchapi.Client) error {
@@ -42,22 +48,31 @@ func (tbi *traceBulkIndexer) start(client *opensearchapi.Client) error {
 func (tbi *traceBulkIndexer) close(ctx context.Context) {
 	closeErr := tbi.bulkIndexer.Close(ctx)
 	if closeErr != nil {
-		tbi.errs = append(tbi.errs, closeErr)
+		tbi.appendError(classifyBulkError(closeErr))
 	}
 }
 
 func (tbi *traceBulkIndexer) onIndexerError(_ context.Context, indexerErr error) {
 	if indexerErr != nil {
-		tbi.appendPermanentError(consumererror.NewPermanent(indexerErr))
+		tbi.appendError(classifyBulkError(indexerErr))
 	}
 }
 
+func (tbi *traceBulkIndexer) appendError(err error) {
+	tbi.errsMu.Lock()
+	defer tbi.errsMu.Unlock()
+	tbi.errs = append(tbi.errs, err)
+}
+
 func (tbi *traceBulkIndexer) appendPermanentError(e error) {
-	tbi.errs = append(tbi.errs, consumererror.NewPermanent(e))
+	if tbi.logger != nil {
+		tbi.logger.Error("OpenSearch rejected a document; it will not be retried", zap.Error(e))
+	}
+	tbi.appendError(consumererror.NewPermanent(e))
 }
 
 func (tbi *traceBulkIndexer) appendRetryTraceError(err error, trace ptrace.Traces) {
-	tbi.errs = append(tbi.errs, consumererror.NewTraces(err, trace))
+	tbi.appendError(consumererror.NewTraces(err, trace))
 }
 
 func (tbi *traceBulkIndexer) submit(ctx context.Context, td ptrace.Traces, ir *indexResolver, cfg *Config, timestamp time.Time) {
@@ -86,7 +101,13 @@ func (tbi *traceBulkIndexer) submit(ctx context.Context, td ptrace.Traces, ir *i
 }
 
 func (tbi *traceBulkIndexer) processItem(ctx context.Context, indexName string, resource pcommon.Resource, resourceSchemaURL string, scope pcommon.InstrumentationScope, scopeSchemaURL string, span ptrace.Span) {
-	payload, err := tbi.model.encodeTrace(resource, scope, scopeSchemaURL, span)
+	var payload []byte
+	var err error
+	if model, ok := tbi.model.(*studioMappingModel); ok {
+		payload, err = model.encodeTraceWithResourceSchema(resource, resourceSchemaURL, scope, scopeSchemaURL, span)
+	} else {
+		payload, err = tbi.model.encodeTrace(resource, scope, scopeSchemaURL, span)
+	}
 	if err != nil {
 		tbi.appendPermanentError(err)
 	} else {
@@ -96,6 +117,9 @@ func (tbi *traceBulkIndexer) processItem(ctx context.Context, indexName string, 
 			tbi.processItemFailure(resp, itemErr, makeTrace(resource, resourceSchemaURL, scope, scopeSchemaURL, span))
 		}
 		bi := tbi.newBulkIndexerItem(payload, indexName)
+		if model, ok := tbi.model.(*studioMappingModel); ok {
+			bi.DocumentID = model.traceDocumentID(span)
+		}
 		bi.OnFailure = ItemFailureHandler
 		err = tbi.bulkIndexer.Add(ctx, bi)
 		if err != nil {
@@ -122,6 +146,8 @@ func makeTrace(resource pcommon.Resource, resourceSchemaURL string, scope pcommo
 
 func (tbi *traceBulkIndexer) processItemFailure(resp opensearchapi.BulkRespItem, itemErr error, traces ptrace.Traces) {
 	switch {
+	case itemErr != nil && !consumererror.IsPermanent(classifyBulkError(itemErr)):
+		tbi.appendRetryTraceError(itemErr, traces)
 	case shouldRetryEvent(resp.Status):
 		// Recoverable OpenSearch error
 		tbi.appendRetryTraceError(responseAsError(resp), traces)
@@ -149,7 +175,7 @@ func attributesToMapString(attributes pcommon.Map) map[string]string {
 }
 
 func shouldRetryEvent(status int) bool {
-	retryOnStatus := []int{500, 502, 503, 504, 429}
+	retryOnStatus := []int{408, 429, 500, 502, 503, 504}
 	return slices.Contains(retryOnStatus, status)
 }
 

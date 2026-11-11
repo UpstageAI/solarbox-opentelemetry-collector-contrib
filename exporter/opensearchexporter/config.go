@@ -89,6 +89,8 @@ type MappingsSettings struct {
 	//   of the OpenSearch document, without any transformation.
 	//   This mapping mode is intended for use cases where the client wishes to have complete control over the
 	//   OpenSearch document structure.
+	//   studio: preserves the Studio OTLP document schema and stable document IDs.
+	//   Requires explicit routing indices, bulk_action: index and no time suffix.
 	Mode string `mapstructure:"mode"`
 
 	// Additional field mappings.
@@ -117,6 +119,7 @@ const (
 	MappingECS
 	MappingFlattenAttributes
 	MappingBodyMap
+	MappingStudio
 )
 
 func (m MappingMode) String() string {
@@ -129,6 +132,8 @@ func (m MappingMode) String() string {
 		return "flatten_attributes"
 	case MappingBodyMap:
 		return "bodymap"
+	case MappingStudio:
+		return "studio"
 	default:
 		return "ss4o"
 	}
@@ -141,6 +146,7 @@ var mappingModes = func() map[string]MappingMode {
 		MappingSS4O,
 		MappingFlattenAttributes,
 		MappingBodyMap,
+		MappingStudio,
 	} {
 		table[strings.ToLower(m.String())] = m
 	}
@@ -184,6 +190,17 @@ func (cfg *Config) Validate() error {
 		multiErr = append(multiErr, errMappingModeInvalid)
 	}
 
+	if cfg.Mode == MappingStudio.String() {
+		if cfg.BulkAction != "index" {
+			multiErr = append(multiErr, errors.New("studio mapping requires bulk_action: index for retry-safe document IDs"))
+		}
+		if cfg.LogsIndexTimeFormat != "" || cfg.TracesIndexTimeFormat != "" {
+			multiErr = append(multiErr, errors.New("studio mapping uses event-time ingest routing; index time suffixes must be empty"))
+		}
+		if cfg.LogsIndex == "" && cfg.TracesIndex == "" {
+			multiErr = append(multiErr, errors.New("studio mapping requires an explicit logs_index or traces_index"))
+		}
+	}
 	return errors.Join(multiErr...)
 }
 

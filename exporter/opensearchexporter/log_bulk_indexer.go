@@ -6,7 +6,7 @@ package opensearchexporter // import "github.com/open-telemetry/opentelemetry-co
 import (
 	"bytes"
 	"context"
-	"errors"
+	"sync"
 	"time"
 
 	"github.com/opensearch-project/opensearch-go/v4/opensearchapi"
@@ -14,17 +14,20 @@ import (
 	"go.opentelemetry.io/collector/consumer/consumererror"
 	"go.opentelemetry.io/collector/pdata/pcommon"
 	"go.opentelemetry.io/collector/pdata/plog"
+	"go.uber.org/zap"
 )
 
 type logBulkIndexer struct {
 	bulkAction  string
 	model       mappingModel
+	logger      *zap.Logger
+	errsMu      sync.Mutex
 	errs        []error
 	bulkIndexer opensearchutil.BulkIndexer
 }
 
 func newLogBulkIndexer(bulkAction string, model mappingModel) *logBulkIndexer {
-	return &logBulkIndexer{bulkAction, model, nil, nil}
+	return &logBulkIndexer{bulkAction: bulkAction, model: model, logger: zap.NewNop()}
 }
 
 func (lbi *logBulkIndexer) start(client *opensearchapi.Client) error {
@@ -34,28 +37,39 @@ func (lbi *logBulkIndexer) start(client *opensearchapi.Client) error {
 }
 
 func (lbi *logBulkIndexer) joinedError() error {
-	return errors.Join(lbi.errs...)
+	lbi.errsMu.Lock()
+	defer lbi.errsMu.Unlock()
+	return joinLogsErrors(lbi.errs)
 }
 
 func (lbi *logBulkIndexer) close(ctx context.Context) {
 	closeErr := lbi.bulkIndexer.Close(ctx)
 	if closeErr != nil {
-		lbi.errs = append(lbi.errs, closeErr)
+		lbi.appendError(classifyBulkError(closeErr))
 	}
 }
 
 func (lbi *logBulkIndexer) onIndexerError(_ context.Context, indexerErr error) {
 	if indexerErr != nil {
-		lbi.appendPermanentError(consumererror.NewPermanent(indexerErr))
+		lbi.appendError(classifyBulkError(indexerErr))
 	}
 }
 
+func (lbi *logBulkIndexer) appendError(err error) {
+	lbi.errsMu.Lock()
+	defer lbi.errsMu.Unlock()
+	lbi.errs = append(lbi.errs, err)
+}
+
 func (lbi *logBulkIndexer) appendPermanentError(e error) {
-	lbi.errs = append(lbi.errs, consumererror.NewPermanent(e))
+	if lbi.logger != nil {
+		lbi.logger.Error("OpenSearch rejected a document; it will not be retried", zap.Error(e))
+	}
+	lbi.appendError(consumererror.NewPermanent(e))
 }
 
 func (lbi *logBulkIndexer) appendRetryLogError(err error, log plog.Logs) {
-	lbi.errs = append(lbi.errs, consumererror.NewLogs(err, log))
+	lbi.appendError(consumererror.NewLogs(err, log))
 }
 
 func (lbi *logBulkIndexer) submit(ctx context.Context, ld plog.Logs, ir *indexResolver, cfg *Config, timestamp time.Time) {
@@ -84,7 +98,13 @@ func (lbi *logBulkIndexer) submit(ctx context.Context, ld plog.Logs, ir *indexRe
 }
 
 func (lbi *logBulkIndexer) processItem(ctx context.Context, indexName string, resource pcommon.Resource, resourceSchemaURL string, scope pcommon.InstrumentationScope, scopeSchemaURL string, logRecord plog.LogRecord) {
-	payload, err := lbi.model.encodeLog(resource, scope, scopeSchemaURL, logRecord)
+	var payload []byte
+	var err error
+	if model, ok := lbi.model.(*studioMappingModel); ok {
+		payload, err = model.encodeLogWithResourceSchema(resource, resourceSchemaURL, scope, scopeSchemaURL, logRecord)
+	} else {
+		payload, err = lbi.model.encodeLog(resource, scope, scopeSchemaURL, logRecord)
+	}
 	if err != nil {
 		lbi.appendPermanentError(err)
 	} else {
@@ -94,6 +114,9 @@ func (lbi *logBulkIndexer) processItem(ctx context.Context, indexName string, re
 			lbi.processItemFailure(resp, itemErr, makeLog(resource, resourceSchemaURL, scope, scopeSchemaURL, logRecord))
 		}
 		bi := lbi.newBulkIndexerItem(payload, indexName)
+		if model, ok := lbi.model.(*studioMappingModel); ok {
+			bi.DocumentID = model.logDocumentID(logRecord)
+		}
 		bi.OnFailure = ItemFailureHandler
 		err = lbi.bulkIndexer.Add(ctx, bi)
 		if err != nil {
@@ -120,6 +143,8 @@ func makeLog(resource pcommon.Resource, resourceSchemaURL string, scope pcommon.
 
 func (lbi *logBulkIndexer) processItemFailure(resp opensearchapi.BulkRespItem, itemErr error, logs plog.Logs) {
 	switch {
+	case itemErr != nil && !consumererror.IsPermanent(classifyBulkError(itemErr)):
+		lbi.appendRetryLogError(itemErr, logs)
 	case shouldRetryEvent(resp.Status):
 		// Recoverable OpenSearch error
 		lbi.appendRetryLogError(responseAsError(resp), logs)
